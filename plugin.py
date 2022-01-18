@@ -7,7 +7,12 @@ import textwrap
 import threading
 import subprocess
 import configparser
+import re
 
+# Remove java offending characters
+def search_n_strip(s):
+    s = re.sub('[Ωµ]', '', s)
+    return s
 
 #
 # FreeRouting round trip invocation:
@@ -16,57 +21,108 @@ import configparser
 # * import generated board.ses file into pcbnew
 #
 class FreeRoutingPlugin(pcbnew.ActionPlugin):
-    
+
     # init in place of constructor
     def defaults(self):
         self.here_path = os.path.dirname(__file__)
-        self.name = "Invoke FreeRouting"
+        self.name = "FreeRouting"
         self.category = "PCB auto routing"
-        self.description = "Invoke FreeRouting for PCB auto routing"
+        self.description = "FreeRouting for PCB auto routing"
         self.show_toolbar_button = True
-        self.icon_file_name = os.path.join(self.here_path, 'icon.png') 
+        self.icon_file_name = os.path.join(self.here_path, 'icon.png')
         
+        # Controls KiCAD session file imports (works only in KiCAD nigthly or 6)
+        self.SPECCTRA=False
+
     # setup execution context
     def prepare(self):
-        
+
         self.board = pcbnew.GetBoard()
         self.path_tuple = os.path.splitext(self.board.GetFileName())
         self.board_prefix = self.path_tuple[0]
-        
+
         config = configparser.ConfigParser()
         config_path = os.path.join(self.here_path, 'plugin.ini')
         config.read(config_path)
 
         self.java_path = config['java']['path']
-        
+
         self.module_file = config['artifact']['location']
         self.module_path = os.path.join(self.here_path, self.module_file)
         
-        self.module_input = self.board_prefix + '.' + config['module']['input_ext']
-        self.module_output = self.board_prefix + '.' + config['module']['output_ext']
-        
-        self.module_command = [self.java_path, "-jar", self.module_path, "-de", self.module_input, "-s"]
-        
-        if os.path.isfile(self.module_input):
+        # Set temp filename
+        #filename = 'freerouting'
+        filename = os.path.dirname(self.board_prefix) + '/freerouting'
+        self.module_input = filename + '.' + config['module']['input_ext']
+        self.module_output = filename + '.' + config['module']['output_ext']
+        self.module_rules = filename + '.' + config['module']['rules_ext']
+        self.module_org_output = self.board_prefix + '.' + config['module']['output_ext']
+        self.module_org_rules = self.board_prefix + '.' + config['module']['rules_ext']
+       
+        # Remove previous temp files
+        try:
             os.remove(self.module_input)
-        if os.path.isfile(self.module_output):
             os.remove(self.module_output)
+            os.remove(self.module_rules)
+        except:
+            pass
         
+        # Create DSN file and remove java offending characters
+        self.bFirstLine = True
+        self.bEatNextLine = False
+        with open(filename + '.' + config['module']['input_ext'], "w") as fw, \
+             open(self.board_prefix + '.' + config['module']['input_ext'],"r") as fr:
+                for l in fr:
+                    if self.bFirstLine:
+                        fw.writelines('(pcb ' + self.module_input + '\n')
+                        self.bFirstLine = False
+                    elif self.bEatNextLine:
+                        self.bEatNextLine = l.rstrip()[-2:]!="))" 
+                        print(l)
+                        print(self.bEatNextLine)
+                        
+                    # Optional: remove one or both copper-pours before run freerouting 
+                    #elif l[:28] == "    (plane GND (polygon F.Cu":
+                    #    self.bEatNextLine = True
+                    #elif l[:28] == "    (plane GND (polygon B.Cu":
+                    #    self.bEatNextLine = True
+                    else:                                               
+                        fw.writelines(search_n_strip(l))
+        fr.close()
+        fw.close()
+        
+        # Run freerouting with -s
+        #self.module_command = [self.java_path, "-jar", self.module_path, "-de", self.module_input, "-s"]
+        
+        # Run freerouting with -do
+        self.module_command = [self.java_path, "-jar", self.module_path, "-de", self.module_input, "-do", self.module_output]
+        
+        if self.SPECCTRA:
+
+            if os.path.isfile(self.module_input):
+                os.remove(self.module_input)
+
+            if os.path.isfile(self.module_output):
+                os.remove(self.module_output)                              
+
     # export board.dsn file from pcbnew
     def RunExport(self):
-        ok = pcbnew.ExportSpecctraDSN(self.module_input)
-        if ok and os.path.isfile(self.module_input):
-            return True
+        if self.SPECCTRA:
+            ok = pcbnew.ExportSpecctraDSN(self.module_input)
+            if ok and os.path.isfile(self.module_input):
+                return True
+            else:
+                wx_show_error("""
+                Failed to invoke:
+                * pcbnew.ExportSpecctraDSN
+                """)
+                return False
         else:
-            wx_show_error("""
-            Failed to invoke:
-            * pcbnew.ExportSpecctraDSN
-            """)
-            return False
+            return True
 
     # auto route by invoking FreeRouting.jar
     def RunRouter(self):
-        
+
         dialog = ProcessDialog(None, """
         Complete or Terminate FreeRouting:
         * to complete, close Java window
@@ -77,12 +133,12 @@ class FreeRoutingPlugin(pcbnew.ActionPlugin):
             wx_safe_invoke(dialog.terminate)
 
         invoker = ProcessThread(self.module_command, on_complete)
-        
+
         dialog.Show()  # dialog first
         invoker.start()  # run java process
         result = dialog.ShowModal()  # block pcbnew here
         dialog.Destroy()
-        
+
         try:
             if result == dialog.result_button:  # return via terminate button
                 invoker.terminate()
@@ -100,38 +156,58 @@ class FreeRoutingPlugin(pcbnew.ActionPlugin):
 
     # import generated board.ses file into pcbnew
     def RunImport(self):
-        ok = pcbnew.ImportSpecctraSES(self.module_output)
-        if ok and os.path.isfile(self.module_output):
-            return True
+        if self.SPECCTRA:
+            ok = pcbnew.ImportSpecctraSES(self.module_output)
+            if ok and os.path.isfile(self.module_output):
+                return True
+            else:
+                wx_show_error("""
+                Failed to invoke:
+                * pcbnew.ImportSpecctraSES
+                """)
+                return False
         else:
-            wx_show_error("""
-            Failed to invoke:
-            * pcbnew.ImportSpecctraSES    
-            """)
-            return False
-        
+            return True
+
     # invoke chain of dependent methods
     def RunSteps(self):
         self.prepare()
+        
         if not self.RunExport() :
-            return 
+            return
         if not self.RunRouter() :
             return
+
+        # Remove temp DSN file
+        os.remove(self.module_input)
+
+        # Rename SES and RULES files
+        try:
+            os.rename(self.module_output,
+                      self.module_org_output)
+            os.rename(self.module_rules,
+                      self.module_org_rules)
+        except:
+            pass
+
         wx_safe_invoke(self.RunImport)
 
     # kicad plugin action entry
     def Run(self):
-        if has_pcbnew_api():
-            self.RunSteps()
+        if self.SPECCTRA:
+            if has_pcbnew_api():
+                self.RunSteps()
+            else:
+                wx_show_error("""
+                Missing required python API:
+                * pcbnew.ExportSpecctraDSN
+                * pcbnew.ImportSpecctraSES
+                ---
+                Try development nightly build:
+                * http://kicad-pcb.org/download/
+                """)
         else:
-            wx_show_error("""
-            Missing required python API:
-            * pcbnew.ExportSpecctraDSN
-            * pcbnew.ImportSpecctraSES
-            ---
-            Try development nightly build:
-            * http://kicad-pcb.org/download/
-            """)
+            self.RunSteps()
 
 
 # provision gui-thread-safe execution context
@@ -170,12 +246,12 @@ def wx_show_error(text):
 class ProcessDialog (wx.Dialog):
 
     def __init__(self, parent, text):
-        
+
         message = textwrap.dedent(text)
-        
+
         self.result_button = wx.NewId()
         self.result_terminate = wx.NewId()
-        
+
         wx.Dialog.__init__ (self, parent, id=wx.ID_ANY, title=wx_caption, pos=wx.DefaultPosition, size=wx.Size(-1, -1), style=wx.CAPTION)
 
         self.SetSizeHints(wx.DefaultSize, wx.DefaultSize)
@@ -188,7 +264,7 @@ class ProcessDialog (wx.Dialog):
 
         self.line = wx.StaticLine(self, wx.ID_ANY, wx.DefaultPosition, wx.DefaultSize, wx.LI_HORIZONTAL)
         sizer.Add(self.line, 0, wx.EXPAND | wx.ALL, 5)
-        
+
         self.bttn = wx.Button(self, wx.ID_ANY, "Terminate", wx.DefaultPosition, wx.DefaultSize, 0)
         self.bttn.SetDefault()
         sizer.Add(self.bttn, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.ALL, 5)
@@ -206,7 +282,7 @@ class ProcessDialog (wx.Dialog):
 
     def bttn_on_click(self, event):
         self.EndModal(self.result_button)
-    
+
     def terminate(self):
         self.EndModal(self.result_terminate)
 
@@ -236,19 +312,19 @@ class ProcessThread(threading.Thread):
 
     def has_code(self):
         return self.has_process() and self.process.returncode != 0
-            
+
     def has_error(self):
         return hasattr(self, "error")
 
     def has_process(self):
         return hasattr(self, "process")
-    
+
     def terminate(self):
         if self.has_process():
             self.process.kill()
         else:
             pass
-    
+
     def show_error(self):
         command = " ".join(self.command)
         if self.has_error() :
